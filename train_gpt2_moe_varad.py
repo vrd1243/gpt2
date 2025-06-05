@@ -15,6 +15,8 @@ from transformers import GPT2LMHeadModel
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from typing import Tuple
+from mixture_of_experts import MoE
 
 @dataclass
 class GPTConfig:
@@ -23,145 +25,58 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-    num_experts: int = 4
+    num_experts: int = 4 # number of experts for smoe
 
-class MLP(nn.Module):
-
-    def __init__(self, config):
-      super().__init__()
-      self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-      self.gelu = nn.GELU(approximate='tanh')
-      self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-      self.c_proj.NANOGPT_SCALE_INIT = 1
+# a 3 layered MLP as the experts
+class Experts(nn.Module):
+    def __init__(self, dim, num_experts = 16):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.randn(num_experts, dim, dim * 4))
+        self.w2 = nn.Parameter(torch.randn(num_experts, dim * 4, dim * 4))
+        self.w3 = nn.Parameter(torch.randn(num_experts, dim * 4, dim))
+        self.act = nn.LeakyReLU(inplace = True)
 
     def forward(self, x):
+        # Use the einstein sum functions to implement a linear layer. Instead, 
+        # we could implement w1, w2 and w3 as linear layers, and then call those 
+        # on the input x. 
 
-      x = self.c_fc(x)
-      x = self.gelu(x)
-      x = self.c_proj(x)
+        hidden1 = self.act(torch.einsum('end,edh->enh', x, self.w1))
+        hidden2 = self.act(torch.einsum('end,edh->enh', hidden1, self.w2))
+        out = torch.einsum('end,edh->enh', hidden2, self.w3)
+        
+        return out
 
-      return x
-
-class SparseGate(nn.Module):
-    """Gating network that determines which experts to use"""
-  
-    def __init__(self, input_dim: int, num_experts: int, top_k: int = 2):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = min(top_k, num_experts)
-        self.gate = nn.Linear(input_dim, num_experts)
-        self.softmax = nn.Softmax(dim=-1)
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Compute gate scores
-        gate_scores = self.gate(x)  # [batch_size, num_experts]
-        
-        # Get top-k experts
-        top_k_scores, top_k_indices = torch.topk(gate_scores, self.top_k, dim=-1)
-        
-        # Apply softmax to top-k scores for normalization
-        top_k_weights = self.softmax(top_k_scores)
-        
-        return top_k_weights, top_k_indices
-
-class SparseMoE(nn.Module):
-    """Sparse Mixture of Experts layer"""
-  
-    def __init__(
-        self, 
-        config,
-        num_experts: int = 8, 
-        top_k: int = 2,
-        dropout: float = 0.1,
-        load_balancing_weight: float = 0.01
-    ):
-      
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.load_balancing_weight = load_balancing_weight
-        
-        # Create experts
-        self.experts = nn.ModuleList([
-            MLP(config) 
-            for _ in range(num_experts)
-        ])
-        
-        # Gating network
-        self.gate = SparseGate(config.n_embd, num_experts, top_k)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, input_dim = x.shape
-        
-        # Flatten for processing
-        x_flat = x.view(-1, input_dim)  # [batch_size * seq_len, input_dim]
-        
-        # Get gating decisions
-        gate_weights, expert_indices = self.gate(x_flat)  # [batch_size * seq_len, top_k]
-        
-        # Initialize output
-        output = torch.zeros(x_flat.shape[0], self.experts[0].net[-1].out_features, 
-                           device=x.device, dtype=x.dtype)
-        
-        # Process each selected expert
-        for i in range(self.top_k):
-            # Get indices for current expert position
-            expert_idx = expert_indices[:, i]  # [batch_size * seq_len]
-            weights = gate_weights[:, i].unsqueeze(-1)  # [batch_size * seq_len, 1]
-            
-            # Group inputs by expert
-            for expert_id in range(self.num_experts):
-                mask = (expert_idx == expert_id)
-                if mask.any():
-                    expert_input = x_flat[mask]
-                    expert_output = self.experts[expert_id](expert_input)
-                    output[mask] += weights[mask] * expert_output
-        
-        # Reshape back to original dimensions
-        output = output.view(batch_size, seq_len, -1)
-        
-        # Compute load balancing loss
-        load_balancing_loss = self._compute_load_balancing_loss(expert_indices)
-        
-        return output, load_balancing_loss
-    
-    def _compute_load_balancing_loss(self, expert_indices: torch.Tensor) -> torch.Tensor:
-        """Compute load balancing loss to encourage uniform expert usage"""
-        batch_size = expert_indices.shape[0]
-        
-        # Count how many times each expert is used
-        expert_counts = torch.zeros(self.num_experts, device=expert_indices.device)
-        for i in range(self.num_experts):
-            expert_counts[i] = (expert_indices == i).float().sum()
-        
-        # Normalize by total assignments
-        expert_freqs = expert_counts / (batch_size * self.top_k)
-        
-        # Compute load balancing loss (encourage uniform distribution)
-        target_freq = 1.0 / self.num_experts
-        load_loss = torch.sum((expert_freqs - target_freq) ** 2)
-        
-        return self.load_balancing_weight * load_loss
+# This is the main causal attention block. We are going to ensure that
+# previous tokens are masked. 
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
       super().__init__()
 
+      # Attention layers start with a simple linear layer, one for three 
+      # parameter types --- k, q, and c. An embedding of side C, will be 
+      # transformed by the c_attn to an embedding of size 3*C. This will be
+      # split later into three embeddings, each of size C. 
+
       self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
       self.c_proj = nn.Linear(config.n_embd, config.n_embd)
       self.c_proj.NANOGPT_SCALE_INIT = 1
 
+      # We are using multihead attention. 
       self.n_head = config.n_head
       self.n_embd = config.n_embd
 
     def forward(self, x):
 
       B, T, C = x.size()
-
+      
+      # Get the attention unified tensor, and split it into three parameters.
       qkv = self.c_attn(x) # B, T, 3*C
       q, k, v = qkv.split(self.n_embd, dim=2) # each is of B, T, C
 
+      
       k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, nh, T, head_size
       q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, nh, T, head_size
       v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, nh, T, head_size
@@ -178,14 +93,25 @@ class Block(nn.Module):
       self.ln_1 = nn.LayerNorm(config.n_embd)
       self.attn = CausalSelfAttention(config)
       self.ln_2 = nn.LayerNorm(config.n_embd)
-      self.smoe = SparseMoE(config)
-
+      # self.smoe = SparseMoE(config)
+      self.experts = Experts(config.n_embd, num_experts = 2)
+      self.moe = MoE(dim = config.n_embd, num_experts = 2, experts = self.experts)
 
     def forward(self, x):
+        
       x = x + self.attn(self.ln_1(x))
-      x = x + self.smoe(self.ln_2(x))
-      return x
 
+      # Handle MoE output properly
+      moe_output = self.moe(self.ln_2(x))
+        
+      if isinstance(moe_output, tuple):
+          moe_out, aux_loss = moe_output
+          x = x + moe_out
+          return x, aux_loss
+      else:
+          x = x + moe_output
+          return x, None
+            
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -228,8 +154,25 @@ class GPT(nn.Module):
       pos_emb = self.transformer.wpe(pos)
       x = tok_emb + pos_emb
 
+      # Collect auxiliary losses from MoE layers
+      total_aux_loss = 0.0
+      aux_loss_count = 0
+      
       for block in self.transformer.h:
-          x = block(x)
+          
+          block_output = block(x)
+          
+          if isinstance(block_output, tuple):
+              
+              x, aux_loss = block_output
+              
+              if aux_loss is not None:
+                  total_aux_loss += aux_loss
+                  aux_loss_count += 1
+          else:
+              
+              x = block_output
+          
       x = self.transformer.ln_f(x)
 
       logits = self.lm_head(x)
@@ -238,6 +181,12 @@ class GPT(nn.Module):
           return logits, None
 
       loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+      if aux_loss_count > 0:
+          
+          avg_aux_loss = total_aux_loss / aux_loss_count
+          # Weight the auxiliary loss (common values are 0.01 to 0.1)
+          loss = loss + 0.01 * avg_aux_loss
 
       return logits, loss
 
@@ -421,14 +370,14 @@ if torch.cuda.is_available():
     
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-model = GPT2LMHeadModel.from_pretrained('gpt2')
+# model = GPT2LMHeadModel.from_pretrained('gpt2')
 
-sd_hf = model.state_dict()
+# sd_hf = model.state_dict()
 
-for k, v in sd_hf.items():
-  print(k, v.shape)
+# for k, v in sd_hf.items():
+#  print(k, v.shape)
 
-torch.set_float32_matmul_precision('high')
+# torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model = GPT(GPTConfig(vocab_size=50304))
