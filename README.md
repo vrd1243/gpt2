@@ -3,6 +3,18 @@
 ## Overview
 This manual provides step-by-step instructions for using the GPT-2 implementation with Mixture of Experts support. The process involves two main steps: data preparation using `fineweb.py` and model training using `train_gpt2_fineweb_edu_moe.py`.
 
+## Credits and Acknowledgments
+This GPT-2 implementation is based on Andrej Karpathy's excellent educational video tutorial ["Let's build GPT: from scratch, in code, spelled out"](https://www.youtube.com/watch?v=l8pRSuU81PU&t=14379s). The repository follows the core architecture and training methodology demonstrated in the video, with additional enhancements including:
+
+- **Mixture of Experts (MoE)**: Added MoE layers as optional replacements for traditional MLP feedforward networks
+- **Distributed Training**: Full PyTorch DDP support for multi-GPU and multi-node training
+- **FineWeb Dataset Integration**: Optimized data pipeline for the FineWeb educational dataset
+- **Advanced Optimizations**: PyTorch 2.0 compilation, mixed precision training, and fused optimizers
+
+We highly recommend watching Karpathy's video to understand the fundamental concepts before using this implementation.
+
+*This comprehensive instruction manual was created by Claude (Anthropic) to help users navigate the repository and successfully train their own GPT-2 models.*
+
 ## Prerequisites
 
 ### System Requirements
