@@ -26,17 +26,38 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-    num_experts: int = 4 # number of experts for smoe
+    use_moe: bool = True # Should we use MoE or a simple MLE for the FFN layer? 
+    num_experts: int = 2 # number of experts for smoe
+    infer_step: int = 250 # Do training loop inference after these steps.
+
+# A traditional MLP. We will use this as a baseline for MoE. 
+class MLP(nn.Module):
+
+    def __init__(self, config):
+      super().__init__()
+      self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+      self.gelu = nn.GELU(approximate='tanh')
+      self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+      self.c_proj.NANOGPT_SCALE_INIT = 1
+
+    def forward(self, x):
+
+      x = self.c_fc(x)
+      x = self.gelu(x)
+      x = self.c_proj(x)
+
+      return x
 
 # a 3 layered MLP as an expert
-
 class Experts(nn.Module):
     def __init__(self, dim, num_experts = 16):
         super().__init__()
-        self.w1 = nn.Parameter(torch.randn(num_experts, dim, dim * 4))
-        self.w2 = nn.Parameter(torch.randn(num_experts, dim * 4, dim * 4))
-        self.w3 = nn.Parameter(torch.randn(num_experts, dim * 4, dim))
-        self.act = nn.LeakyReLU(inplace = True)
+
+         # Proper initialization
+        self.w1 = nn.Parameter(torch.randn(num_experts, dim, dim * 4) * (0.02 / (dim ** 0.5)))
+        self.w2 = nn.Parameter(torch.randn(num_experts, dim * 4, dim * 4) * (0.02 / ((dim * 4) ** 0.5)))
+        self.w3 = nn.Parameter(torch.randn(num_experts, dim * 4, dim) * (0.02 / ((dim * 4) ** 0.5)))
+        self.gelu = nn.GELU()  # GELU is more common in transformers
 
     def forward(self, x):
         
@@ -44,8 +65,8 @@ class Experts(nn.Module):
         # we could implement w1, w2 and w3 as linear layers, and then call those 
         # on the input x. 
 
-        hidden1 = self.act(torch.einsum('end,edh->enh', x, self.w1))
-        hidden2 = self.act(torch.einsum('end,edh->enh', hidden1, self.w2))
+        hidden1 = self.gelu(torch.einsum('end,edh->enh', x, self.w1))
+        hidden2 = self.gelu(torch.einsum('end,edh->enh', hidden1, self.w2))
         out = torch.einsum('end,edh->enh', hidden2, self.w3)
         
         return out
@@ -124,15 +145,22 @@ class Block(nn.Module):
       self.ln_1 = nn.LayerNorm(config.n_embd)
       self.attn = CausalSelfAttention(config)
       self.ln_2 = nn.LayerNorm(config.n_embd)
-      self.experts = Experts(config.n_embd, num_experts = 2)
-      self.moe = MoE(dim = config.n_embd, num_experts = 2, experts = self.experts)
+
+      if config.use_moe: 
+          # Use MoE
+          self.experts = Experts(config.n_embd, num_experts = config.num_experts)
+          self.ffn = MoE(dim = config.n_embd, num_experts = config.num_experts, experts = self.experts)
+      
+      else:
+          # Use MLP
+          self.ffn = MLP(config)
 
     def forward(self, x):
         
       x = x + self.attn(self.ln_1(x))
 
       # Handle MoE output properly
-      moe_output = self.moe(self.ln_2(x))
+      moe_output = self.ffn(self.ln_2(x))
 
       # MoE returns the output and a load-balancing loss.  
       # The load-balancing loss determines whether certain experts
@@ -254,57 +282,9 @@ class GPT(nn.Module):
           
           avg_aux_loss = total_aux_loss / aux_loss_count
           # Weight the auxiliary loss (common values are 0.01 to 0.1)
-          loss = loss + 0.01 * avg_aux_loss
+          loss = loss + 0.000 * avg_aux_loss
 
       return logits, loss
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-
-        config_args['block_size'] = 1024
-        config_args['vocab_size'] = 50257
-
-        config = GPTConfig(**config_args)
-
-        # Load my model, and get keys
-
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # Load the HF GPT 2 model transformer.
-        hf_model = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = hf_model.state_dict()
-        sd_hf_keys = sd_hf.keys()
-
-        # We remove certain keys fromt the hf model.
-        sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('. c_attn.masked_bias')]
-        sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('.attn.bias')]
-
-        assert len(sd_hf_keys) == len(sd_keys), f"mismatched keys {len(sd_hf_keys)} != {len(sd_keys)}"
-
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-
-        for k in sd_hf_keys:
-
-            if any(k.endswith(w) for w in transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                sd[k].copy_(sd_hf[k])
-
-        return model
 
     # Generate text from a trained model. The input x needs to be
     # extended by max_length. 
@@ -391,6 +371,8 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
 
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+
+        return optimizer
 
 # Helper function that loads data for finewebedu files. 
 def load_tokens(filename):
@@ -527,7 +509,9 @@ else:
     ddp_local_rank = 0
     ddp_world_size = 1
     master_process = True
+    
     # attempt to autodetect device
+    
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
@@ -541,20 +525,14 @@ if torch.cuda.is_available():
     
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-# model = GPT2LMHeadModel.from_pretrained('gpt2')
-
-# sd_hf = model.state_dict()
-
-# for k, v in sd_hf.items():
-#   print(k, v.shape)
-
 torch.set_float32_matmul_precision('high')
 
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 
 # Set up model. 
 
-model = GPT(GPTConfig(vocab_size=50304))
+config = GPTConfig(vocab_size=50304)
+model = GPT(config)
 model.to(device)
 
 # We compile the model, instead of have it run dynamically at run time. This 
@@ -616,7 +594,7 @@ for epoch in range(max_steps):
     last_step = (epoch == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if epoch % 250 == 0 or last_step:
+    if epoch % config.infer_step == 0 or last_step:
         
         # We put our model in eval mode, which disables dropout and other regularization. 
 
@@ -674,7 +652,7 @@ for epoch in range(max_steps):
 
     # once in a while generate from the model (except step 0, which is noise)
     
-    if ((epoch > 0 and epoch % 250 == 0) or last_step) and (not use_compile):
+    if ((epoch > 0 and epoch % config.infer_step == 0) or last_step) and (not use_compile):
         
         model.eval()
         num_return_sequences = 4
