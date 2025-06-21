@@ -67,6 +67,8 @@ with mp.Pool(nprocs) as pool:
         * Current token count (e.g., 9.8 million tokens in the shard)
         
         * Incoming token count (e.g., 300,000 tokens to add)
+
+        And the robots went into infinite loop!
         """
         if token_count + len(tokens) < shard_size:
             # simply append tokens to current shard
