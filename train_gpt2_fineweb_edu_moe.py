@@ -26,11 +26,10 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
-    use_moe: bool = True # Should we use MoE or a simple MLE for the FFN layer? 
-    num_experts: int = 2 # number of experts for smoe
-    infer_step: int = 250 # Do training loop inference after these steps.
+    num_experts: int = 16 # number of experts for smoe
 
 # A traditional MLP. We will use this as a baseline for MoE. 
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -52,12 +51,16 @@ class MLP(nn.Module):
 class Experts(nn.Module):
     def __init__(self, dim, num_experts = 16):
         super().__init__()
+        # self.w1 = nn.Parameter(torch.randn(num_experts, dim, dim * 4))
+        # self.w2 = nn.Parameter(torch.randn(num_experts, dim * 4, dim * 4))
+        # self.w3 = nn.Parameter(torch.randn(num_experts, dim * 4, dim))
+        # self.act = nn.LeakyReLU(inplace = True)
 
          # Proper initialization
         self.w1 = nn.Parameter(torch.randn(num_experts, dim, dim * 4) * (0.02 / (dim ** 0.5)))
         self.w2 = nn.Parameter(torch.randn(num_experts, dim * 4, dim * 4) * (0.02 / ((dim * 4) ** 0.5)))
         self.w3 = nn.Parameter(torch.randn(num_experts, dim * 4, dim) * (0.02 / ((dim * 4) ** 0.5)))
-        self.gelu = nn.GELU()  # GELU is more common in transformers
+        self.act = nn.GELU()  # GELU is more common in transformers
 
     def forward(self, x):
         
@@ -65,8 +68,8 @@ class Experts(nn.Module):
         # we could implement w1, w2 and w3 as linear layers, and then call those 
         # on the input x. 
 
-        hidden1 = self.gelu(torch.einsum('end,edh->enh', x, self.w1))
-        hidden2 = self.gelu(torch.einsum('end,edh->enh', hidden1, self.w2))
+        hidden1 = self.act(torch.einsum('end,edh->enh', x, self.w1))
+        hidden2 = self.act(torch.einsum('end,edh->enh', hidden1, self.w2))
         out = torch.einsum('end,edh->enh', hidden2, self.w3)
         
         return out
@@ -145,22 +148,16 @@ class Block(nn.Module):
       self.ln_1 = nn.LayerNorm(config.n_embd)
       self.attn = CausalSelfAttention(config)
       self.ln_2 = nn.LayerNorm(config.n_embd)
-
-      if config.use_moe: 
-          # Use MoE
-          self.experts = Experts(config.n_embd, num_experts = config.num_experts)
-          self.ffn = MoE(dim = config.n_embd, num_experts = config.num_experts, experts = self.experts)
-      
-      else:
-          # Use MLP
-          self.ffn = MLP(config)
+      # self.experts = Experts(config.n_embd, num_experts = 2)
+      # self.moe = MoE(dim = config.n_embd, num_experts = 2, experts = self.experts)
+      self.moe = MLP(config)
 
     def forward(self, x):
         
       x = x + self.attn(self.ln_1(x))
 
       # Handle MoE output properly
-      moe_output = self.ffn(self.ln_2(x))
+      moe_output = self.moe(self.ln_2(x))
 
       # MoE returns the output and a load-balancing loss.  
       # The load-balancing loss determines whether certain experts
@@ -282,9 +279,57 @@ class GPT(nn.Module):
           
           avg_aux_loss = total_aux_loss / aux_loss_count
           # Weight the auxiliary loss (common values are 0.01 to 0.1)
-          loss = loss + 0.000 * avg_aux_loss
+          loss = loss + 0.1 * avg_aux_loss
 
       return logits, loss
+
+    @classmethod
+    def from_pretrained(cls, model_type):
+
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+
+        config_args['block_size'] = 1024
+        config_args['vocab_size'] = 50257
+
+        config = GPTConfig(**config_args)
+
+        # Load my model, and get keys
+
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # Load the HF GPT 2 model transformer.
+        hf_model = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = hf_model.state_dict()
+        sd_hf_keys = sd_hf.keys()
+
+        # We remove certain keys fromt the hf model.
+        sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('. c_attn.masked_bias')]
+        sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('.attn.bias')]
+
+        assert len(sd_hf_keys) == len(sd_keys), f"mismatched keys {len(sd_hf_keys)} != {len(sd_keys)}"
+
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        for k in sd_hf_keys:
+
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                sd[k].copy_(sd_hf[k])
+
+        return model
 
     # Generate text from a trained model. The input x needs to be
     # extended by max_length. 
@@ -453,6 +498,37 @@ class DataLoaderLite:
             # Return the batch. 
             return inputs, targets
 
+# -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    
+    pred_norm = avg_loss.argmin().item()
+    
+    return pred_norm
+
 # Choose learning rate based on where we are in the training epoch loop. 
 
 def get_lr(step):
@@ -509,9 +585,7 @@ else:
     ddp_local_rank = 0
     ddp_world_size = 1
     master_process = True
-    
     # attempt to autodetect device
-    
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
@@ -525,14 +599,20 @@ if torch.cuda.is_available():
     
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
+# model = GPT2LMHeadModel.from_pretrained('gpt2')
+
+# sd_hf = model.state_dict()
+
+# for k, v in sd_hf.items():
+#   print(k, v.shape)
+
 torch.set_float32_matmul_precision('high')
 
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 
 # Set up model. 
 
-config = GPTConfig(vocab_size=50304)
-model = GPT(config)
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 
 # We compile the model, instead of have it run dynamically at run time. This 
@@ -594,7 +674,8 @@ for epoch in range(max_steps):
     last_step = (epoch == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if epoch % config.infer_step == 0 or last_step:
+
+    if epoch % 250 == 0 or last_step:
         
         # We put our model in eval mode, which disables dropout and other regularization. 
 
@@ -652,7 +733,7 @@ for epoch in range(max_steps):
 
     # once in a while generate from the model (except step 0, which is noise)
     
-    if ((epoch > 0 and epoch % config.infer_step == 0) or last_step) and (not use_compile):
+    if ((epoch > 0 and epoch % 250 == 0) or last_step) and (not use_compile):
         
         model.eval()
         num_return_sequences = 4
@@ -676,6 +757,7 @@ for epoch in range(max_steps):
             with torch.no_grad():
                 
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 
                 # take the logits at the last position
@@ -713,6 +795,50 @@ for epoch in range(max_steps):
             
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
+    # once in a while evaluate hellaswag
+    
+    if (epoch % 250 == 0 or last_step) and (not use_compile):
+        
+        num_correct_norm = 0
+        num_total = 0
+        
+        for i, example in enumerate(iterate_examples("val")):
+            
+            # only process examples where i % ddp_world_size == ddp_rank
+            
+            if i % ddp_world_size != ddp_rank:
+                continue
+            
+            # render the example into tokens and labels
+            
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+           
+            # get the logits
+            
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        
+        # reduce the stats across all processes
+        
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{epoch} hella {acc_norm:.4f}\n")
 
     # Training loop
     
