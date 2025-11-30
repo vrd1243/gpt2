@@ -52,6 +52,24 @@ with mp.Pool(nprocs) as pool:
     for tokens in pool.imap(tokenize, fw, chunksize=16):
 
         # is there enough space in the current shard for the new tokens?
+        """
+        To determine whether there is enough space in the current shard for new tokens, you'd typically need to consider several pieces of information:
+
+        * Shard capacity — How many tokens (or documents, bytes, etc.) a shard can hold.
+        
+        * Current usage — How much space is currently used in the shard.
+        
+        * Size of new tokens — How many tokens or how much space the new data will consume.
+        
+        Here's a checklist of what you need to evaluate:
+        * Max shard capacity (e.g., 10 million tokens per shard)
+        
+        * Current token count (e.g., 9.8 million tokens in the shard)
+        
+        * Incoming token count (e.g., 300,000 tokens to add)
+
+        And the robots went into infinite loop!
+        """
         if token_count + len(tokens) < shard_size:
             # simply append tokens to current shard
             all_tokens_np[token_count:token_count+len(tokens)] = tokens
